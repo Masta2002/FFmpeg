@@ -274,6 +274,11 @@ which streams to actually receive.
 Each stream mirrors the @code{id} and @code{bandwidth} properties from the
 @code{<Representation>} as metadata keys named "id" and "variant_bitrate" respectively.
 
+For live media fragments, transient open failures (including HTTP 404 and 5xx)
+are retried at most twice, with interruptible 400 millisecond waits. VOD,
+initialization sections, and permanent errors such as HTTP 401/403 are not
+retried by this recovery path.
+
 @subsection Options
 
 This demuxer accepts the following option:
@@ -286,6 +291,12 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 @item cenc_decryption_keys
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
+
+@item dash_subtitle_default_discard
+Initially discard all manifest subtitle representations, including unprobed
+streams. Disabled by default. Interactive players can enable this before
+probing to prevent sparse, unselected subtitles from starving audio/video,
+then set the chosen stream's discard flag to @code{AVDISCARD_DEFAULT}.
 
 @end table
 

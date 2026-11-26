@@ -204,6 +204,8 @@ typedef struct DASHContext {
     int live_delay;
     /* Option: reuse HTTP connections for segments and manifest */
     int http_persistent;
+    /* Option: the streams of the subtitle representations start discarded */
+    int subtitle_default_discard;
     AVIOContext *mpd_pb;
     /* redirect learned from the CDN: requests to redirect_from go to redirect_to */
     char *redirect_from;
@@ -1757,21 +1759,64 @@ static int64_t live_delay(DASHContext *c)
  *
  * Take the start once, from the oldest edge of all video and audio
  * representations, and use it for every representation.
+ *
+ * A window that is shorter than the delay must not put the start on its
+ * oldest segments, which expire while they are opened: the start stays two
+ * segment durations behind the beginning of every timeline (of the time
+ * shift buffer, if the manifest gives its depth), and before the last
+ * segment of every timeline, so that the selector finds a segment.
  */
 static int64_t calc_common_live_start(DASHContext *c)
 {
     int64_t edge = INT64_MAX;
+    int64_t earliest = INT64_MIN;
+    int64_t latest = INT64_MAX;
     int64_t delay = live_delay(c);
     int i;
 
-    for (i = 0; i < c->n_videos; i++)
-        edge = FFMIN(edge, timeline_end_time(c->videos[i]));
-    for (i = 0; i < c->n_audios; i++)
-        edge = FFMIN(edge, timeline_end_time(c->audios[i]));
+    for (i = 0; i < c->n_videos + c->n_audios; i++) {
+        struct representation *rep = i < c->n_videos ?
+            c->videos[i] : c->audios[i - c->n_videos];
+        int64_t end = timeline_end_time(rep);
+        edge = FFMIN(edge, end);
+        if (rep->n_timelines && rep->fragment_timescale > 0 &&
+            rep->timelines[0]->duration > 0) {
+            int64_t first = av_rescale(rep->timelines[0]->starttime,
+                                      AV_TIME_BASE, rep->fragment_timescale);
+            int64_t duration = av_rescale(rep->timelines[0]->duration,
+                                         AV_TIME_BASE, rep->fragment_timescale);
+            int64_t safe;
+            if (c->time_shift_buffer_depth &&
+                c->time_shift_buffer_depth <= INT64_MAX / AV_TIME_BASE)
+                first = FFMAX(first, end - (int64_t)c->time_shift_buffer_depth * AV_TIME_BASE);
+            safe = av_sat_add64(first, av_sat_add64(duration, duration));
+            earliest = FFMAX(earliest, safe);
+            /* The timeline selector advances past an exact segment boundary. */
+            latest = FFMIN(latest, end -
+                           av_rescale(rep->timelines[rep->n_timelines - 1]->duration,
+                                      AV_TIME_BASE, rep->fragment_timescale) -
+                           av_rescale_rnd(1, AV_TIME_BASE, rep->fragment_timescale, AV_ROUND_UP));
+        }
+    }
 
     if (edge == INT64_MAX)
         return AV_NOPTS_VALUE;
-    return edge - delay * AV_TIME_BASE;
+    return FFMIN(latest, FFMIN(edge - 1, FFMAX(edge - delay * AV_TIME_BASE, earliest)));
+}
+
+/* Distance to the live edge in seconds for segments of a fixed duration
+ * that are counted from availabilityStartTime: the live_delay option, else
+ * suggestedPresentationDelay, else four segment durations and at least the
+ * delay of the SegmentTimeline case. The segment at the edge itself is not
+ * published yet. */
+static int64_t duration_live_delay(DASHContext *c, struct representation *pls)
+{
+    if (c->live_delay > 0)
+        return c->live_delay;
+    if (c->suggested_presentation_delay > 0)
+        return c->suggested_presentation_delay;
+    return FFMAX(live_delay(c), av_rescale_rnd(4, pls->fragment_duration,
+                                              pls->fragment_timescale, AV_ROUND_UP));
 }
 
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
@@ -1814,7 +1859,11 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
                     num = pls->first_seq_no + (((c->publish_time - c->time_shift_buffer_depth + pls->fragment_duration) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
                 }
             } else {
-                num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
+                int64_t elapsed = get_current_time_in_sec() - c->availability_start_time;
+                int64_t delay = duration_live_delay(c, pls);
+                elapsed = elapsed > delay ? elapsed - delay : 0;
+                num = pls->first_seq_no + av_rescale_rnd(elapsed, pls->fragment_timescale,
+                                                       pls->fragment_duration, AV_ROUND_DOWN);
             }
         }
     } else {
@@ -1854,7 +1903,10 @@ static int64_t calc_max_seg_no(struct representation *pls, DASHContext *c)
             }
         }
     } else if (c->is_live && pls->fragment_duration) {
-        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration;
+        /* The newest segment that is complete. The segment the clock is in
+         * is still being produced: it is there when its duration has
+         * passed, a request before that is answered with 404. */
+        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration - 1;
     } else if (pls->fragment_duration) {
         num = pls->first_seq_no + av_rescale_rnd(1, c->media_presentation_duration * pls->fragment_timescale, pls->fragment_duration, AV_ROUND_UP);
     }
@@ -2300,6 +2352,38 @@ static int update_init_section(struct representation *pls)
     return 0;
 }
 
+static int retryable_fragment_error(int error)
+{
+    return error == AVERROR_HTTP_NOT_FOUND || error == AVERROR_HTTP_SERVER_ERROR ||
+           error == AVERROR(ETIMEDOUT) || error == AVERROR(ECONNRESET) ||
+           error == AVERROR(ECONNREFUSED) || error == AVERROR(EPIPE) ||
+           error == AVERROR(EIO) || error == AVERROR(EAGAIN);
+}
+
+/* Open the current media fragment. A live fragment that cannot be opened
+ * for a reason that may pass (not published yet, a server or connection
+ * error) is tried twice more, 400 ms apart, before the caller gives it up. */
+static int open_media_fragment(DASHContext *c, struct representation *v)
+{
+    int ret, attempt;
+    for (attempt = 0; ; attempt++) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
+        ret = open_input(c, v, v->cur_seg);
+        if (ret >= 0 || !c->is_live || attempt == 2 || !retryable_fragment_error(ret))
+            return ret;
+        av_log(v->parent, AV_LOG_WARNING,
+               "Live fragment open failed (%s), retrying (%d/2)\n",
+               av_err2str(ret), attempt + 1);
+        /* Also works for DASH builds without network protocol support. */
+        for (int waited = 0; waited < 400000; waited += 10000) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_usleep(10000);
+        }
+    }
+}
+
 static int64_t seek_data(void *opaque, int64_t offset, int whence)
 {
     struct representation *v = opaque;
@@ -2332,7 +2416,7 @@ restart:
         if (ret)
             goto end;
 
-        ret = open_input(c, v, v->cur_seg);
+        ret = open_media_fragment(c, v);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback)) {
                 ret = AVERROR_EXIT;
@@ -2640,6 +2724,20 @@ static void move_metadata(AVStream *st, const char *key, char **value)
     }
 }
 
+/* dash_subtitle_default_discard: the streams of all subtitle representations
+ * start with AVDISCARD_ALL, so that the first read closes them and they do
+ * not hold back audio and video; the caller enables the stream it wants. */
+static void discard_initial_subtitles(DASHContext *c)
+{
+    int i, j;
+
+    if (!c->subtitle_default_discard)
+        return;
+    for (i = 0; i < c->n_subtitles; i++)
+        for (j = 0; j < c->subtitles[i]->nb_assoc_stream; j++)
+            c->subtitles[i]->assoc_stream[j]->discard = AVDISCARD_ALL;
+}
+
 static int dash_read_header(AVFormatContext *s)
 {
     DASHContext *c = s->priv_data;
@@ -2812,6 +2910,7 @@ static int dash_read_header(AVFormatContext *s)
         stg->params.layered_video->el_index = stg->nb_streams - 1;
     }
 
+    discard_initial_subtitles(c);
     return 0;
 }
 
@@ -3082,6 +3181,8 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         if (dry_run)
             return 0;
         ff_read_frame_flush(pls->ctx);
+        if (seek_pos_msec > INT64_MAX / 1000 || seek_pos_msec < INT64_MIN / 1000)
+            return AVERROR(EINVAL);
         return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
     }
 
@@ -3092,13 +3193,17 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         int64_t num = pls->first_seq_no;
         /* the packets of all representations were shifted by first_pts_time (AV_TIME_BASE) */
         if (c->first_pts_time != AV_NOPTS_VALUE)
-            seek_pos_msec += c->first_pts_time / 1000;
+            seek_pos_msec = av_sat_add64(seek_pos_msec,
+                av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, (AVRational){1, 1000}));
 
         if(c->is_live)
         {
             /* don't allow to jump after last available segment */
-            int64_t seek_limit = av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF), 1000, pls->fragment_timescale)
-                                 - 2 * c->min_buffer_time * 1000;
+            int64_t seek_limit = av_sat_sub64(
+                av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF),
+                           1000, pls->fragment_timescale),
+                c->min_buffer_time > INT64_MAX / 2000 ? INT64_MAX :
+                (int64_t)c->min_buffer_time * 2000);
 
             if( seek_limit < seek_pos_msec )
             {
@@ -3114,13 +3219,15 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
                 duration = pls->timelines[i]->starttime;
             }
             duration += pls->timelines[i]->duration;
-            if (seek_pos_msec < av_rescale(duration, 1000, pls->fragment_timescale)) {
+            /* the end of a segment rounded up: rounded down, a position in
+             * its last millisecond would be taken for the next segment */
+            if (seek_pos_msec < av_rescale_rnd(duration, 1000, pls->fragment_timescale, AV_ROUND_UP)) {
                 goto set_seq_num;
             }
             for (j = 0; j < pls->timelines[i]->repeat; j++) {
                 duration += pls->timelines[i]->duration;
                 num++;
-                if (seek_pos_msec < av_rescale(duration, 1000, pls->fragment_timescale)) {
+                if (seek_pos_msec < av_rescale_rnd(duration, 1000, pls->fragment_timescale, AV_ROUND_UP)) {
                     goto set_seq_num;
                 }
             }
@@ -3132,7 +3239,9 @@ set_seq_num:
         av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline end cur_seq_no[%"PRId64"].\n",
                (int64_t)pls->cur_seq_no);
     } else if (pls->fragment_duration > 0) {
-        pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
+        pls->cur_seq_no = av_sat_add64(pls->first_seq_no,
+            av_rescale_rnd(seek_pos_msec, pls->fragment_timescale, 1000, AV_ROUND_DOWN) /
+            pls->fragment_duration);
     } else {
         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
         pls->cur_seq_no = pls->first_seq_no;
@@ -3149,8 +3258,9 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
 {
     int ret = 0, i;
     DASHContext *c = s->priv_data;
-    int64_t seek_pos_msec = av_rescale_rnd(timestamp, 1000,
-                                           s->streams[stream_index]->time_base.den,
+    int64_t seek_pos_msec = av_rescale_q_rnd(timestamp,
+                                           s->streams[stream_index]->time_base,
+                                           (AVRational){1, 1000},
                                            flags & AVSEEK_FLAG_BACKWARD ?
                                            AV_ROUND_DOWN : AV_ROUND_UP);
     if ((flags & AVSEEK_FLAG_BYTE))
@@ -3215,6 +3325,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
+    { "dash_subtitle_default_discard", "Initially discard all subtitle representations until selected by the caller", OFFSET(subtitle_default_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "max_reload", "Maximum number of manifest reloads in get_current_fragment() before giving up",
