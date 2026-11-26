@@ -176,6 +176,7 @@ typedef struct DASHContext {
     int is_init_section_common_audio;
     int is_init_section_common_subtitle;
 
+    uint64_t playlist_load_time;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -1385,6 +1386,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
         if (ret == 0)
             ret = AVERROR_INVALIDDATA;
     } else {
+        c->playlist_load_time = get_current_time_in_sec();
         LIBXML_TEST_VERSION
 
         doc = xmlReadMemory(buf.str, buf.len, c->base_url, NULL, 0);
@@ -1528,7 +1530,14 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
             num = pls->first_seq_no;
         } else if (pls->n_timelines) {
             av_log(s, AV_LOG_TRACE, "in n_timelines mode\n");
-            start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - 60 * pls->fragment_timescale; // 60 seconds before end
+            if (c->min_buffer_time > 0)
+            {
+                start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - (2 * c->min_buffer_time) * pls->fragment_timescale;
+            }
+            else
+            {
+                start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - 60 * pls->fragment_timescale; // 60 seconds before end
+            }
             num = calc_next_seg_no_from_timelines(pls, start_time_offset);
             if (num == -1)
                 num = pls->first_seq_no;
@@ -1639,6 +1648,16 @@ static int refresh_manifest(AVFormatContext *s)
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
 
+    uint64_t cur_time = get_current_time_in_sec();
+//    uint64_t publish_time = c->publish_time > 0 ? c->publish_time : c->playlist_load_time;
+    uint64_t publish_time = c->playlist_load_time;
+
+    if ( publish_time > 0 && (publish_time + c->minimum_update_period) >= cur_time) {
+        av_log(s, AV_LOG_TRACE, "Manifest refresh not needed - current one is still %"PRIu64"s valid\n", (publish_time + c->minimum_update_period) - cur_time);
+        /* > 0: manifest was not reloaded (callers counting reloads use this) */
+        return 1;
+    }
+
     c->base_url = NULL;
     c->n_videos = 0;
     c->videos = NULL;
@@ -1704,6 +1723,23 @@ static int refresh_manifest(AVFormatContext *s)
         }
     }
 
+    for (i = 0; i < n_subtitles; i++) {
+        struct representation *cur_subtitle = subtitles[i];
+        struct representation *ccur_subtitle = c->subtitles[i];
+        if (cur_subtitle->timelines && cur_subtitle->fragment_timescale > 0) {
+            // calc current time
+            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
+            // update segments
+            ccur_subtitle->cur_seq_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1);
+            if (ccur_subtitle->cur_seq_no >= 0) {
+                move_timelines(ccur_subtitle, cur_subtitle, c);
+            }
+        }
+        if (cur_subtitle->fragments) {
+            move_segments(ccur_subtitle, cur_subtitle, c);
+        }
+    }
+
 finish:
     // restore context
     if (c->base_url)
@@ -1735,7 +1771,9 @@ static struct fragment *get_current_fragment(struct representation *pls)
     struct fragment *seg_ptr = NULL;
     DASHContext *c = pls->parent->priv_data;
     int reload_count = 0;
+    int wait_count = 0;
 
+try_again:
     while (( !ff_check_interrupt(c->interrupt_callback)&& pls->n_fragments > 0)) {
         if (pls->cur_seq_no >= 0 && pls->cur_seq_no < pls->n_fragments) {
             seg_ptr = pls->fragments[pls->cur_seq_no];
@@ -1752,13 +1790,18 @@ static struct fragment *get_current_fragment(struct representation *pls)
             seg->url_offset = seg_ptr->url_offset;
             return seg;
         } else if (c->is_live) {
-            if (reload_count++ >= c->max_reload) {
+            if (reload_count >= c->max_reload) {
                 av_log(pls->parent, AV_LOG_ERROR,
                        "Reached max manifest reloads (%d) at seq %"PRId64"\n",
                        c->max_reload, pls->cur_seq_no);
                 return NULL;
             }
-            refresh_manifest(pls->parent);
+            if (refresh_manifest(pls->parent) > 0) {
+                /* manifest is still valid - wait instead of counting a reload */
+                av_usleep(100*1000);
+            } else {
+                reload_count++;
+            }
         } else {
             break;
         }
@@ -1774,7 +1817,21 @@ static struct fragment *get_current_fragment(struct representation *pls)
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
-            av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: min[%"PRId64"] max[%"PRId64"]\n", min_seq_no, max_seq_no);
+            av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+
+            /* we are reading data too fast - wait and try again later, because we will get HTTP 404 ...*/
+            if (++wait_count > c->max_reload) {
+                av_log(pls->parent, AV_LOG_ERROR,
+                       "Reached max manifest reloads (%d) at seq %"PRId64"\n",
+                       c->max_reload, pls->cur_seq_no);
+                return NULL;
+            }
+            av_usleep(100*1000);
+            if (ff_check_interrupt(c->interrupt_callback))
+                return NULL;
+            goto try_again;
+        } else {
+            av_log(pls->parent, AV_LOG_VERBOSE, "cur fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
         }
         seg = av_mallocz(sizeof(struct fragment));
         if (!seg) {
