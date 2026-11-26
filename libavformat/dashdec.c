@@ -182,6 +182,15 @@ typedef struct DASHContext {
 
     uint64_t playlist_load_time;
     int fake_last_subtitle;
+
+    /* Common start position for live SegmentTimeline streams, in
+     * AV_TIME_BASE units; AV_NOPTS_VALUE until it has been computed. */
+    int64_t live_start_time;
+    /* Media time subtracted from the timestamps of every representation,
+     * in AV_TIME_BASE units; AV_NOPTS_VALUE until the first packet. */
+    int64_t first_pts_time;
+    /* Option: distance to the live edge in seconds, 0 = automatic */
+    int live_delay;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -1529,6 +1538,64 @@ cleanup:
     return ret;
 }
 
+static int64_t timeline_end_time(struct representation *pls)
+{
+    if (!pls->n_timelines || pls->fragment_timescale <= 0)
+        return INT64_MAX;
+    /* with a seq_no past the last segment this returns the end of the timeline */
+    return av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF),
+                      AV_TIME_BASE, pls->fragment_timescale);
+}
+
+/*
+ * Distance to the live edge in seconds. Twice minBufferTime is not enough
+ * for every packager: with minBufferTime="PT2S" (Sky) it leaves two to four
+ * seconds, while 1.92 s segments are published in bursts up to 3.4 s apart.
+ * The player then keeps catching up with the edge and the picture stalls.
+ * Use at least suggestedPresentationDelay and LIVE_DELAY_MIN seconds; the
+ * live_delay option overrides all of it.
+ */
+#define LIVE_DELAY_MIN 12
+
+static int64_t live_delay(DASHContext *c)
+{
+    int64_t delay;
+
+    if (c->live_delay > 0)
+        return c->live_delay;
+    delay = c->min_buffer_time > 0 ? 2 * c->min_buffer_time : 60;
+    delay = FFMAX(delay, (int64_t)c->suggested_presentation_delay);
+    return FFMAX(delay, LIVE_DELAY_MIN);
+}
+
+/*
+ * All representations of a live stream have to start at the same media time.
+ * Packagers do not publish all AdaptationSets at the same moment; the video
+ * timeline can end a whole segment later than the audio timeline. Computing
+ * the start from each representation's own edge then makes audio and video
+ * start one segment apart, and because the manifest is refreshed while the
+ * first representation is opened, later representations may even be
+ * positioned against a newer manifest.
+ *
+ * Take the start once, from the oldest edge of all video and audio
+ * representations, and use it for every representation.
+ */
+static int64_t calc_common_live_start(DASHContext *c)
+{
+    int64_t edge = INT64_MAX;
+    int64_t delay = live_delay(c);
+    int i;
+
+    for (i = 0; i < c->n_videos; i++)
+        edge = FFMIN(edge, timeline_end_time(c->videos[i]));
+    for (i = 0; i < c->n_audios; i++)
+        edge = FFMIN(edge, timeline_end_time(c->audios[i]));
+
+    if (edge == INT64_MAX)
+        return AV_NOPTS_VALUE;
+    return edge - delay * AV_TIME_BASE;
+}
+
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
 {
     DASHContext *c = s->priv_data;
@@ -1541,7 +1608,13 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
             num = pls->first_seq_no;
         } else if (pls->n_timelines) {
             av_log(s, AV_LOG_TRACE, "in n_timelines mode\n");
-            if (c->min_buffer_time > 0)
+            if (c->live_start_time == AV_NOPTS_VALUE)
+                c->live_start_time = calc_common_live_start(c);
+            if (c->live_start_time != AV_NOPTS_VALUE)
+            {
+                start_time_offset = av_rescale(c->live_start_time, pls->fragment_timescale, AV_TIME_BASE);
+            }
+            else if (c->min_buffer_time > 0)
             {
                 start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - (2 * c->min_buffer_time) * pls->fragment_timescale;
             }
@@ -1646,6 +1719,28 @@ static void move_segments(struct representation *rep_src, struct representation 
 }
 
 
+/* Position of a representation after a manifest reload (SegmentTimeline).
+ * cur_seq_no is an absolute segment number (first_seq_no + index).
+ * $Number$ templates: the number stays valid, keep it; falling out of the
+ * window is handled later in get_current_fragment().
+ * Other templates: map via media time, old segment -> time -> new segment.
+ * In 9.0.2 get_segment_start_time_based_on_timeline() takes and
+ * calc_next_seg_no_from_timelines() returns absolute segment numbers. */
+static int64_t refreshed_seq_no(DASHContext *c, struct representation *old, struct representation *neu)
+{
+    int64_t seq_no, t;
+
+    if (old->url_template && av_stristr(old->url_template, "$Number"))
+        return old->cur_seq_no;
+
+    seq_no = FFMAX(old->cur_seq_no, old->first_seq_no);
+    t = get_segment_start_time_based_on_timeline(old, seq_no);
+    seq_no = calc_next_seg_no_from_timelines(neu, t - 1);
+    if (seq_no < 0) /* not published yet: the next segment after the new timeline */
+        seq_no = calc_max_seg_no(neu, c) + 1;
+    return seq_no;
+}
+
 static int refresh_manifest(AVFormatContext *s)
 {
     int ret = 0, i;
@@ -1705,19 +1800,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_video = videos[i];
         struct representation *ccur_video = c->videos[i];
         if (cur_video->timelines && cur_video->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_video, cur_video->cur_seq_no) / cur_video->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1);
-
-            // update segments
-            if( cur_video->cur_seq_no > next_seg_no || cur_video->cur_seq_no < calc_min_seg_no(s, ccur_video) )
-            {
-                ccur_video->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_video->cur_seq_no = cur_video->cur_seq_no;
-            }
+            ccur_video->cur_seq_no = refreshed_seq_no(c, cur_video, ccur_video);
 
             if (ccur_video->cur_seq_no >= 0) {
                 move_timelines(ccur_video, cur_video, c);
@@ -1731,19 +1814,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_audio = audios[i];
         struct representation *ccur_audio = c->audios[i];
         if (cur_audio->timelines && cur_audio->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_audio, cur_audio->cur_seq_no) / cur_audio->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1);
-
-            // update segments
-            if( cur_audio->cur_seq_no > next_seg_no || cur_audio->cur_seq_no < calc_min_seg_no(s, ccur_audio))
-            {
-                ccur_audio->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_audio->cur_seq_no = cur_audio->cur_seq_no;
-            }
+            ccur_audio->cur_seq_no = refreshed_seq_no(c, cur_audio, ccur_audio);
 
             if (ccur_audio->cur_seq_no >= 0) {
                 move_timelines(ccur_audio, cur_audio, c);
@@ -1758,19 +1829,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_subtitle = subtitles[i];
         struct representation *ccur_subtitle = c->subtitles[i];
         if (cur_subtitle->timelines && cur_subtitle->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1);
-
-            // update segments
-            if( cur_subtitle->cur_seq_no > next_seg_no || cur_subtitle->cur_seq_no < calc_min_seg_no(s, ccur_subtitle))
-            {
-                ccur_subtitle->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_subtitle->cur_seq_no = cur_subtitle->cur_seq_no;
-            }
+            ccur_subtitle->cur_seq_no = refreshed_seq_no(c, cur_subtitle, ccur_subtitle);
 
             if (ccur_subtitle->cur_seq_no >= 0) {
                 move_timelines(ccur_subtitle, cur_subtitle, c);
@@ -1865,6 +1924,8 @@ try_again:
         }
         if (pls->cur_seq_no < min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+            /* fell out of the time shift buffer, start again from the current edge */
+            c->live_start_time = AV_NOPTS_VALUE;
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
@@ -2376,6 +2437,8 @@ static int dash_read_header(AVFormatContext *s)
     int i, j;
 
     c->interrupt_callback = &s->interrupt_callback;
+    c->live_start_time = AV_NOPTS_VALUE;
+    c->first_pts_time = AV_NOPTS_VALUE;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -2615,14 +2678,21 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret >= 0) {
             if(cur->n_fragments != 1)
             {
-                /* in multifragments mode - ensure, that PTS always starts from 0 */
-                if(cur->first_pts == INT64_MIN && pkt->pts != AV_NOPTS_VALUE)
+                /* in multifragments mode - ensure, that PTS always starts from 0.
+                 * All representations subtract the same media time - the time of
+                 * the first packet of the session - so that the offset between
+                 * audio and video is kept instead of being cut away. */
+                if (cur->first_pts == INT64_MIN && pkt->pts != AV_NOPTS_VALUE)
                 {
-                    av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", pkt->pts, cur->id);
-                    cur->first_pts = pkt->pts;
+                    AVRational tb = cur->ctx->streams[0]->time_base;
+                    if (c->first_pts_time == AV_NOPTS_VALUE)
+                        c->first_pts_time = av_rescale_q(pkt->pts, tb, AV_TIME_BASE_Q);
+                    cur->first_pts = av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, tb);
+                    av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", cur->first_pts, cur->id);
                 }
 
-                if (cur->first_pts != INT64_MIN) {
+                if (cur->first_pts != INT64_MIN)
+                {
                     if (pkt->pts != AV_NOPTS_VALUE)
                         pkt->pts -= cur->first_pts;
                     if (pkt->dts != AV_NOPTS_VALUE)
@@ -2691,10 +2761,9 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     // find the nearest fragment
     if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
         int64_t num = pls->first_seq_no;
-        /* first_pts is in the time base of the inner demuxer's stream */
-        if (pls->first_pts != INT64_MIN && pls->ctx && pls->ctx->nb_streams > 0)
-            seek_pos_msec += av_rescale_q(pls->first_pts, pls->ctx->streams[0]->time_base,
-                                          (AVRational){ 1, 1000 });
+        /* the packets of all representations were shifted by first_pts_time (AV_TIME_BASE) */
+        if (c->first_pts_time != AV_NOPTS_VALUE)
+            seek_pos_msec += c->first_pts_time / 1000;
 
         if(c->is_live)
         {
@@ -2814,6 +2883,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "max_reload", "Maximum number of manifest reloads in get_current_fragment() before giving up",
         OFFSET(max_reload), AV_OPT_TYPE_INT, { .i64 = 100 }, 0, INT_MAX, FLAGS },
