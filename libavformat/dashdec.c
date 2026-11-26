@@ -127,6 +127,8 @@ struct representation {
     int64_t cur_timestamp;
     int64_t first_pts;
     int inactive;        /* closed because its streams are discarded or ended */
+    int ended;           /* read to its end and closed: stays closed until a seek,
+                          * or until the caller discards and selects it again */
     int drop_pending;    /* switched in: drop the packets before drop_target */
     int64_t drop_target; /* in 90 kHz ticks, on the timeline of the returned packets */
     int is_restart_needed;
@@ -1606,8 +1608,9 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
             ret = AVERROR_INVALIDDATA;
             goto cleanup;
         }
-        if (!av_strcasecmp(val, "dynamic"))
-            c->is_live = 1;
+        /* also on a reload: a live presentation that has ended is
+         * published as static, and is read to its end from then on */
+        c->is_live = !av_strcasecmp(val, "dynamic");
         xmlFree(val);
 
         attr = node->properties;
@@ -1983,6 +1986,7 @@ static int refresh_manifest(AVFormatContext *s)
     int n_subtitles = c->n_subtitles;
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
+    int was_live = c->is_live;
 
     uint64_t cur_time = get_current_time_in_sec();
 //    uint64_t publish_time = c->publish_time > 0 ? c->publish_time : c->playlist_load_time;
@@ -2070,7 +2074,23 @@ static int refresh_manifest(AVFormatContext *s)
         }
     }
 
+    if (was_live && !c->is_live) {
+        /* The presentation has ended. The last segment of a SegmentTemplate
+         * with a duration was taken from the clock while it was live; it is
+         * the end of mediaPresentationDuration now. SegmentTimeline and
+         * SegmentList took theirs from the new manifest above. */
+        struct representation **lists[] = { videos, audios, subtitles };
+        int counts[] = { n_videos, n_audios, n_subtitles };
+        av_log(s, AV_LOG_VERBOSE, "The live presentation has ended, the manifest is static\n");
+        for (int l = 0; l < 3; l++)
+            for (i = 0; i < counts[l]; i++)
+                if (!lists[l][i]->n_timelines && !lists[l][i]->n_fragments)
+                    lists[l][i]->last_seq_no = calc_max_seg_no(lists[l][i], c);
+    }
+
 finish:
+    if (ret)
+        c->is_live = was_live;
     // restore context
     if (c->base_url)
         av_free(base_url);
@@ -2423,6 +2443,13 @@ restart:
                 goto end;
             }
             av_log(v->parent, AV_LOG_WARNING, "Failed to open fragment of playlist\n");
+            /* A live SegmentTemplate with a duration is read by the clock,
+             * its manifest is not reloaded while segments come. A segment
+             * that is not there may be one after the end: the manifest says
+             * whether the presentation has ended (it is static then, and
+             * the representation is read to its end). */
+            if (c->is_live && !v->n_timelines && !v->n_fragments)
+                refresh_manifest(v->parent);
             if (++v->n_open_failures > c->max_reload) {
                 av_log(v->parent, AV_LOG_ERROR,
                        "Reached max consecutive fragment open failures (%d), giving up\n",
@@ -2571,7 +2598,15 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     else if (c->cenc_decryption_keys)
         av_dict_set(&in_fmt_opts, "decryption_keys", c->cenc_decryption_keys, 0);
 
-    if(pls->type == AVMEDIA_TYPE_SUBTITLE && c->fake_last_subtitle)
+    /* The fake last subtitle is a packet with the largest timestamp: the
+     * end of the subtitles. A representation read in segments opens a
+     * demuxer for every segment; with the packet at the end of each of them
+     * the representation had the largest timestamp after its first segment
+     * and was not read again (dash_read_packet() reads the representation
+     * with the smallest one). Only the demuxer of the last segment gets it. */
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE && c->fake_last_subtitle &&
+       (pls->n_fragments ? pls->cur_seq_no >= pls->n_fragments - 1 :
+                           !c->is_live && pls->cur_seq_no >= pls->last_seq_no))
     {
         av_dict_set(&in_fmt_opts, "fake_last_subtitle", "1", 0);
     }
@@ -2950,7 +2985,9 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
         for (int j = 0; j < pls->nb_assoc_stream; j++)
             needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
 
-        if (needed && !pls->ctx) {
+        if (!needed)
+            pls->ended = 0;
+        if (needed && !pls->ctx && !pls->ended) {
             int by_time = switch_in_by_time(c, pls);
             int64_t position = 0;
 
@@ -3135,14 +3172,30 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             else
                 ff_format_io_close(cur->parent, &cur->input);
             ret = reopen_demux_for_component(s, cur);
+            if (ret < 0 && ret != AVERROR_EXIT && !c->is_live && !cur->ctx &&
+                cur->cur_seq_no >= cur->last_seq_no) {
+                /* The last segment number of a SegmentTemplate with a
+                 * duration is computed from the duration of the
+                 * presentation in whole seconds and can be one past the
+                 * last segment there is. That it cannot be opened is the
+                 * end of this representation, not an error of the stream:
+                 * the others are read on. */
+                ff_format_io_close(cur->parent, &cur->input);
+                cur->inactive = 1;
+                cur->ended = 1;
+                av_log(s, AV_LOG_DEBUG, "No segment %"PRId64" on stream_index %d, taken as its end\n",
+                       cur->cur_seq_no, cur->stream_index);
+                return FFERROR_REDO;
+            }
         } else if (ret == AVERROR_EOF) {
             close_demux_for_component(cur);
             ff_format_io_close(cur->parent, &cur->input);
             cur->inactive = 1;
             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
-            // prevent recheck_discard_flags() from re-enabling the component
-            for (int i = 0; i < cur->nb_assoc_stream; i++)
-                cur->assoc_stream[i]->discard = AVDISCARD_ALL;
+            /* recheck_discard_flags() does not open it again. The discard
+             * flags of its streams stay as the caller set them: a seek
+             * reads the representation again. */
+            cur->ended = 1;
             return FFERROR_REDO;
         }
     }
@@ -3254,6 +3307,43 @@ set_seq_num:
     return ret;
 }
 
+/* Seek one representation. A closed one is only positioned (dry run) and
+ * opened when its streams are selected, with one exception: a representation
+ * that was closed because it was read to its end, and whose streams the
+ * caller still wants, is read again from the new position. A player that
+ * buffers ahead reaches the end of a short stream long before it has played
+ * it; its seeks must not be answered with the end of the stream. */
+static int seek_representation(AVFormatContext *s, struct representation *pls,
+                               int64_t seek_pos_msec, int flags)
+{
+    int dry_run = !pls->ctx;
+    int ret;
+
+    if (dry_run && pls->ended) {
+        int needed = !pls->nb_assoc_stream;
+
+        for (int j = 0; j < pls->nb_assoc_stream; j++)
+            needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
+        pls->ended = 0;
+        if (needed) {
+            pls->cur_seg_offset = 0;
+            pls->init_sec_buf_read_offset = 0;
+            pls->is_restart_needed = 0;
+            if (pls->n_fragments == 1) {
+                /* a single file is seeked in its demuxer, which is gone */
+                ret = reopen_demux_for_component(s, pls);
+                if (ret < 0)
+                    return ret;
+            }
+            dry_run = 0;
+        }
+    }
+    ret = dash_seek(s, pls, seek_pos_msec, flags, dry_run);
+    if (!dry_run && ret >= 0 && pls->ctx)
+        pls->inactive = 0;
+    return ret;
+}
+
 static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
 {
     int ret = 0, i;
@@ -3274,15 +3364,15 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
     /* Seek in discarded streams with dry_run=1 to avoid reopening them */
     for (i = 0; i < c->n_videos; i++) {
         if (!ret)
-            ret = dash_seek(s, c->videos[i], seek_pos_msec, flags, !c->videos[i]->ctx);
+            ret = seek_representation(s, c->videos[i], seek_pos_msec, flags);
     }
     for (i = 0; i < c->n_audios; i++) {
         if (!ret)
-            ret = dash_seek(s, c->audios[i], seek_pos_msec, flags, !c->audios[i]->ctx);
+            ret = seek_representation(s, c->audios[i], seek_pos_msec, flags);
     }
     for (i = 0; i < c->n_subtitles; i++) {
         if (!ret)
-            ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
+            ret = seek_representation(s, c->subtitles[i], seek_pos_msec, flags);
     }
     if (!ret)
         c->cur_timestamp = av_rescale(seek_pos_msec, 90, 1);
