@@ -27,6 +27,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/uuid.h"
 #include "internal.h"
 #include "avio_internal.h"
 #include "dash.h"
@@ -137,6 +138,8 @@ struct representation {
 
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
+    char *cenc_pssh; /* base64 pssh boxes of the ContentProtection elements, comma separated */
+    char *cenc_kid; /* default_KID of a ContentProtection element, as hex */
     enum AVMediaType type;
 };
 
@@ -183,6 +186,7 @@ typedef struct DASHContext {
     char *cenc_decryption_keys;
     char *cenc_decryption_video_key;
     char *cenc_decryption_audio_key;
+    char *cenc_decryption_key_url;
     int audioRepIdx;
     int videoRepIdx;
     int audio_rep_index;
@@ -440,6 +444,8 @@ static void free_representation(struct representation *pls)
     av_freep(&pls->id);
     av_freep(&pls->cenc_decryption_key);
     av_freep(&pls->cenc_decryption_keys);
+    av_freep(&pls->cenc_pssh);
+    av_freep(&pls->cenc_kid);
     av_freep(&pls);
 }
 
@@ -762,6 +768,76 @@ static xmlNodePtr find_child_node_by_name(xmlNodePtr rootnode, const char *noden
         node = xmlNextElementSibling(node);
     }
     return NULL;
+}
+
+/**
+ * Add the cenc:pssh boxes (base64) of the ContentProtection elements of node
+ * to the comma separated list *pssh, each box once.
+ */
+static int add_content_protection_pssh(char **pssh, xmlNodePtr node)
+{
+    for (xmlNodePtr cp = node ? xmlFirstElementChild(node) : NULL; cp; cp = xmlNextElementSibling(cp)) {
+        if (av_strcasecmp(cp->name, "ContentProtection"))
+            continue;
+        for (xmlNodePtr box = xmlFirstElementChild(cp); box; box = xmlNextElementSibling(box)) {
+            char *text, *b64, *joined;
+            int len = 0;
+
+            if (av_strcasecmp(box->name, "pssh"))
+                continue;
+            text = xmlNodeGetContent(box);
+            if (!text)
+                continue;
+            b64 = av_strdup(text);
+            xmlFree(text);
+            if (!b64)
+                return AVERROR(ENOMEM);
+            for (char *r = b64; *r; r++)
+                if (!av_isspace(*r))
+                    b64[len++] = *r;
+            b64[len] = 0;
+            if (!len || (*pssh && strstr(*pssh, b64))) {
+                av_free(b64);
+                continue;
+            }
+            joined = *pssh ? av_asprintf("%s,%s", *pssh, b64) : av_strdup(b64);
+            av_free(b64);
+            if (!joined)
+                return AVERROR(ENOMEM);
+            av_free(*pssh);
+            *pssh = joined;
+        }
+    }
+    return 0;
+}
+
+static int add_content_protection_kid(AVFormatContext *s, char **kid, xmlNodePtr node)
+{
+    for (xmlNodePtr cp = node ? xmlFirstElementChild(node) : NULL; cp; cp = xmlNextElementSibling(cp)) {
+        AVUUID kid_bytes;
+        char kid_hex[AV_UUID_LEN * 2 + 1];
+        xmlChar *default_kid;
+
+        if (av_strcasecmp(cp->name, "ContentProtection") || *kid)
+            continue;
+        default_kid = xmlGetNsProp(cp, "default_KID", "urn:mpeg:cenc:2013");
+        if (!default_kid)
+            default_kid = xmlGetProp(cp, "default_KID");
+        if (!default_kid)
+            continue;
+        if (av_uuid_parse((const char *)default_kid, kid_bytes)) {
+            av_log(s, AV_LOG_WARNING, "Invalid cenc:default_KID '%s'\n", default_kid);
+            xmlFree(default_kid);
+            continue;
+        }
+        ff_data_to_hex(kid_hex, kid_bytes, AV_UUID_LEN, 1);
+        kid_hex[sizeof(kid_hex) - 1] = 0;
+        *kid = av_strdup(kid_hex);
+        xmlFree(default_kid);
+        if (!*kid)
+            return AVERROR(ENOMEM);
+    }
+    return 0;
 }
 
 static enum AVMediaType get_content_type(xmlNodePtr node)
@@ -1209,6 +1285,13 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         if (!rep->cenc_decryption_keys)
             goto enomem;
     }
+
+    if (c->cenc_decryption_key_url &&
+        (add_content_protection_pssh(&rep->cenc_pssh, adaptionset_node) < 0 ||
+         add_content_protection_pssh(&rep->cenc_pssh, representation_node) < 0 ||
+         add_content_protection_kid(s, &rep->cenc_kid, representation_node) < 0 ||
+         add_content_protection_kid(s, &rep->cenc_kid, adaptionset_node) < 0))
+        goto enomem;
 
     baseurl_nodes[0] = mpd_baseurl_node;
     baseurl_nodes[1] = period_baseurl_node;
@@ -1686,6 +1769,38 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
                 }
             } else if (!av_strcasecmp(node->name, "ProgramInformation")) {
                 parse_programinformation(s, node);
+            } else if (!av_strcasecmp(node->name, "cenc_decryption_key_url")) {
+                /* the manifest takes priority over the option */
+                val = xmlNodeGetContent(node);
+                if (val && *val) {
+                    size_t base_len = c->base_url ? strlen(c->base_url) : 0;
+                    size_t val_len = strlen(val);
+                    char *key_url;
+
+                    if (!c->base_url || base_len >= INT_MAX ||
+                        val_len >= INT_MAX - base_len - 1) {
+                        xmlFree(val);
+                        ret = AVERROR(ENOMEM);
+                        goto cleanup;
+                    }
+                    key_url = av_malloc(base_len + val_len + 2);
+                    if (!key_url) {
+                        xmlFree(val);
+                        ret = AVERROR(ENOMEM);
+                        goto cleanup;
+                    }
+                    ret = ff_make_absolute_url(key_url, base_len + val_len + 2,
+                                               c->base_url, val);
+                    if (ret < 0) {
+                        av_log(s, AV_LOG_ERROR, "Invalid manifest key URL '%s'\n", val);
+                        av_free(key_url);
+                        xmlFree(val);
+                        goto cleanup;
+                    }
+                    av_free(c->cenc_decryption_key_url);
+                    c->cenc_decryption_key_url = key_url;
+                }
+                xmlFree(val);
             }
             node = xmlNextElementSibling(node);
         }
@@ -2666,6 +2781,15 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
 
     pls->ctx->pb = &pls->pb.pub;
     pls->ctx->io_open  = nested_io_open;
+    ffformatcontext(pls->ctx)->cenc_key_parent = s;
+
+    if (c->cenc_decryption_key_url) {
+        av_dict_set(&in_fmt_opts, "decryption_key_url", c->cenc_decryption_key_url, 0);
+        if (pls->cenc_pssh)
+            av_dict_set(&in_fmt_opts, "decryption_pssh", pls->cenc_pssh, 0);
+        if (pls->cenc_kid)
+            av_dict_set(&in_fmt_opts, "decryption_kid", pls->cenc_kid, 0);
+    }
 
     if (pls->cenc_decryption_key)
         av_dict_set(&in_fmt_opts, "decryption_key", pls->cenc_decryption_key, 0);
@@ -3497,6 +3621,8 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "cenc_decryption_key_url", "URL that is opened for the key of a KID cenc_decryption_keys does not have ({kid}, {type}, {pssh}; see decryption_key_url of the mov demuxer)",
+        OFFSET(cenc_decryption_key_url), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, .flags = FLAGS },
     { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
     { "dash_subtitle_default_discard", "Initially discard all subtitle representations until selected by the caller", OFFSET(subtitle_default_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
