@@ -160,6 +160,7 @@ typedef struct DASHContext {
     char *adaptionset_lang;
 
     int is_live;
+    int is_startover;
     AVIOInterruptCB *interrupt_callback;
     char *allowed_extensions;
     AVDictionary *avio_opts;
@@ -1451,6 +1452,9 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
             } else if (!av_strcasecmp(attr->name, "mediaPresentationDuration")) {
                 c->media_presentation_duration = get_duration_insec(s, val);
                 av_log(s, AV_LOG_TRACE, "c->media_presentation_duration = [%"PRId64"]\n", c->media_presentation_duration);
+            } else if (!av_strcasecmp(attr->name, "startover")) {
+                c->is_startover = (av_strcasecmp(val, "1") == 0);
+                av_log(s, AV_LOG_TRACE, "c->is_startover = [%d]\n", c->is_startover);
             }
             attr = attr->next;
             xmlFree(val);
@@ -1531,7 +1535,7 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
     int64_t num = 0;
     int64_t start_time_offset = 0;
 
-    if (c->is_live) {
+    if (c->is_live && !c->is_startover) {
         if (pls->n_fragments) {
             av_log(s, AV_LOG_TRACE, "in n_fragments mode\n");
             num = pls->first_seq_no;
@@ -1840,7 +1844,10 @@ try_again:
             } else {
                 reload_count++;
             }
-            pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
+            if(c->is_startover)
+            {
+                pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
+            }
         } else {
             break;
         }
@@ -1851,7 +1858,10 @@ try_again:
 
         if (pls->timelines || pls->fragments) {
             refresh_manifest(pls->parent);
-            pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
+            if(c->is_startover)
+            {
+                pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
+            }
         }
         if (pls->cur_seq_no < min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
@@ -2158,9 +2168,11 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         goto fail;
     }
     ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
-                      pls, read_data, NULL, seek_data);
+                      pls, read_data, NULL, c->is_live && !c->is_startover ? NULL : seek_data);
 
-    if(pls->type == AVMEDIA_TYPE_SUBTITLE || pls->n_timelines || pls->n_fragments > 1)
+    /* a SegmentTemplate with a duration has neither timelines nor fragments,
+     * but many segments: only a single file is seekable */
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE || pls->n_timelines || pls->n_fragments > 1 || pls->url_template || c->is_live)
     {
         pls->pb.pub.seekable = 0;
     }
@@ -2655,6 +2667,7 @@ static int dash_close(AVFormatContext *s)
 
 static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags, int dry_run)
 {
+    DASHContext *c = s->priv_data;
     int ret = 0;
     int i = 0;
     int j = 0;
@@ -2682,6 +2695,18 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         if (pls->first_pts != INT64_MIN && pls->ctx && pls->ctx->nb_streams > 0)
             seek_pos_msec += av_rescale_q(pls->first_pts, pls->ctx->streams[0]->time_base,
                                           (AVRational){ 1, 1000 });
+
+        if(c->is_live)
+        {
+            /* don't allow to jump after last available segment */
+            int64_t seek_limit = av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF), 1000, pls->fragment_timescale)
+                                 - 2 * c->min_buffer_time * 1000;
+
+            if( seek_limit < seek_pos_msec )
+            {
+                seek_pos_msec = seek_limit;
+            }
+        }
 
         av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline start n_timelines[%d] "
                "last_seq_no[%"PRId64"].\n",
@@ -2730,10 +2755,10 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
                                            s->streams[stream_index]->time_base.den,
                                            flags & AVSEEK_FLAG_BACKWARD ?
                                            AV_ROUND_DOWN : AV_ROUND_UP);
-    if ((flags & AVSEEK_FLAG_BYTE) || c->is_live)
+    if ((flags & AVSEEK_FLAG_BYTE))
         return AVERROR(ENOSYS);
 
-    if (c->is_live && c->time_shift_buffer_depth <=0)
+    if (c->is_live && (!c->is_startover || c->time_shift_buffer_depth <=0) )
     {
         return AVERROR(ENOSYS);
     }
