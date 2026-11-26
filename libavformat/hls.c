@@ -859,6 +859,9 @@ static int parse_playlist(HLSContext *c, const char *url,
         if (c->http_persistent)
             av_dict_set(&opts, "multiple_requests", "1", 0);
 
+        // don't use byterange when loading playlist - some servers don't like that and return HTTP 416
+        av_dict_set(&opts, "seekable", "0", 0);
+
         ret = open_url(c->ctx, &in, url, &opts, NULL, NULL);
         av_dict_free(&opts);
         if (ret < 0)
@@ -1517,6 +1520,11 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg,
         av_dict_set_int(&opts, "end_offset", *end, 0);
     }
 
+    if (pls->is_subtitle) {
+        // don't try to load subtitles using byterange - some servers will respond with HTTP 416
+        av_dict_set(&opts, "seekable", "0", 0);
+    }
+
     av_log(pls->parent, AV_LOG_VERBOSE, "HLS request for url '%s', offset %"PRId64", playlist %d\n",
            seg->url, seg->url_offset, pls->index);
 
@@ -1977,7 +1985,7 @@ restart:
     if (v->input && !v->ctx)
         ff_format_io_close(v->parent, &v->input);
 
-    if (!v->input && !v->ctx) {
+    if (!v->ctx) {
         ret = init_subtitle_context(v);
         if (ret < 0)
             return ret;
